@@ -35,8 +35,8 @@ load_dotenv()
 # ══════════════════════════════════════════════════════════════════════════════
 # INITIALIZATION
 # ══════════════════════════════════════════════════════════════════════════════
-PROJECT_ID = "pdf-rag-vertex"  # Change to your GCP Project ID
-LOCATION = "us-central1"
+PROJECT_ID = os.getenv("GCP_PROJECT_ID")
+LOCATION = os.getenv("GCP_LOCATION")
 vertexai.init(project=PROJECT_ID, location=LOCATION)
 
 app = FastAPI(title="Vertex AI RAG Backend")
