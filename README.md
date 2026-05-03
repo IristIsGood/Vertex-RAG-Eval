@@ -1,9 +1,8 @@
 ---
 
 # 📄 Vertex AI RAG Evaluation
-**Production-grade RAG system for long PDF documents, built on Google Cloud's Vertex AI with rigorous, multi-judge evaluation.**
 
-*Why this project matters:** Most tutorials stop at a working demo. This project includes a **full evaluation pipeline** with RAGAS metrics, classic IR metrics, and an **independent judge model** (GPT-4o-mini) to avoid self-evaluation bias. The goal is not just to build RAG, but to *prove it works*.
+A methodical RAG system built on Vertex AI that focuses on the "science" of retrieval. It implements manual batching for high-token PDFs and an independent evaluation suite (RAGAS + GPT-4o-mini judge) to ensure answers are grounded in facts, not hallucinations. The goal is to demonstrate a repeatable workflow for testing and validating AI accuracy.
 
 ---
 ## Live Demo 
