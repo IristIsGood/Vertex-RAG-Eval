@@ -1,3 +1,10 @@
 .env
 venv/
 __pycache__/
+.env
+venv/
+__pycache__/
+*.pyc
+.DS_Store
+*.log
+.pytest_cache/*.log

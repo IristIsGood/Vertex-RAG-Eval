@@ -1,0 +1,33 @@
+# Web framework
+fastapi
+uvicorn
+python-multipart
+streamlit
+requests
+
+# Environment
+python-dotenv
+
+# LangChain core
+langchain
+langchain-community
+langchain-core
+langchain-text-splitters
+
+# Google Cloud / Vertex AI
+google-cloud-aiplatform
+langchain-google-vertexai
+langchain-google-community[vertexaisearch]
+
+# OpenAI (for evaluation judge)
+langchain-openai
+openai
+
+# RAG components
+faiss-cpu
+pypdf
+
+# Evaluation
+ragas
+datasets
+pandas

@@ -1,266 +1,293 @@
 import os
+import uvicorn
+import tempfile
+import vertexai
+from dotenv import load_dotenv
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from pydantic import BaseModel
+from typing import List
+
+# Vertex AI & LangChain
+from langchain_google_vertexai import VertexAIEmbeddings, ChatVertexAI
+from langchain_google_community import VertexAIRank
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_community.vectorstores import FAISS
-from langchain_classic.chains import RetrievalQA # ← fixed: not langchain_classic
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+
+# RAGAS for Evaluation
+from ragas import evaluate
+from ragas.metrics import faithfulness, context_recall
+from ragas.llms import LangchainLLMWrapper
+from ragas.embeddings import LangchainEmbeddingsWrapper
+from datasets import Dataset
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STEP 1 — API KEY
+# LOAD ENVIRONMENT VARIABLES
 # ══════════════════════════════════════════════════════════════════════════════
-# EN: Never hardcode API keys in code. Use .env files instead (see previous lesson).
-# ZH: 永远不要把 API 密钥写在代码里，应该使用 .env 文件管理密钥。
-os.environ["OPENAI_API_KEY"] = "YOUR-NEW-KEY-HERE"
-
-
-# 🚀 1. “Chat with Your PDF” (RAG Project)
-# 💡 What you’ll learn
-# * RAG (Retrieval-Augmented Generation)
-# * Embeddings + vector databases
-# * Basic LangChain pipeline
-# 🛠 What to build
-# Upload a PDF → ask questions → AI answers based on the document.
-# ⚙️ Tech stack
-# * Python
-# * LangChain
-# * OpenAI API (or local model)
-# * FAISS (vector database)
+# EN: Load OPENAI_API_KEY from .env file (used only for RAGAS evaluation,
+#     not for the RAG pipeline itself).
+# ZH: 从 .env 文件加载 OPENAI_API_KEY（仅用于 RAGAS 评估，不用于 RAG 流程）。
+load_dotenv()
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STEP 2 — DOCUMENT LOADING
+# INITIALIZATION
 # ══════════════════════════════════════════════════════════════════════════════
-#
-# EN: A "Document Loader" reads a file and converts it into LangChain's
-#     standard Document object: { page_content: "...", metadata: { page: 0 } }
-#     LangChain has 100+ loaders: PDF, Word, websites, Notion, YouTube, etc.
-#
-# ZH: "文档加载器" 读取文件并转换为 LangChain 标准的 Document 对象：
-#     { page_content: "文本内容", metadata: { page: 页码 } }
-#     LangChain 支持 100+ 种加载器：PDF、Word、网页、Notion、YouTube 等。
-#
-# INTERVIEW QUESTION 面试题:
-#   Q: What is a Document in LangChain?
-#   A: A Document is a standard data object with two fields:
-#      page_content (the text) and metadata (source, page number, etc.)
-#
-PDF_PATH = "Best Loser Wins Why Normal Thinking Never Wins the Trading Game.pdf"
+PROJECT_ID = "pdf-rag-vertex"  # Change to your GCP Project ID
+LOCATION = "us-central1"
+vertexai.init(project=PROJECT_ID, location=LOCATION)
 
-loader = PyPDFLoader(PDF_PATH)
-pages = loader.load()
-print(f"✅ Loaded {len(pages)} pages from your PDF.")
+app = FastAPI(title="Vertex AI RAG Backend")
+
+# Initialize models (using latest stable versions for new GCP projects)
+embeddings = VertexAIEmbeddings(model_name="text-embedding-005", project=PROJECT_ID,location=LOCATION)
+llm = ChatVertexAI(model_name="gemini-2.5-flash", temperature=0, project=PROJECT_ID,location=LOCATION)
+
+# Global vectorstore (in-memory for this demo)
+# In production, replace with Vertex AI Vector Search (Managed Index)
+vectorstore = None
+
+
+class QuestionRequest(BaseModel):
+    question: str
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STEP 3 — TEXT SPLITTING (CHUNKING)
+# HELPER: BATCHED FAISS BUILDER
 # ══════════════════════════════════════════════════════════════════════════════
-#
-# EN: WHY do we split? LLMs have a "context window" — a maximum number of
-#     tokens they can process at once (e.g. gpt-4o-mini = 128,000 tokens).
-#     More importantly, sending an entire book to the LLM every time a user
-#     asks a question is extremely expensive and slow.
-#     So instead, we split the document into small chunks and only send
-#     the RELEVANT chunks to the LLM. This is the core idea of RAG.
-#
-# ZH: 为什么要分块？LLM 有"上下文窗口"限制——每次能处理的 token 数量有上限
-#     （如 gpt-4o-mini 最多 128,000 tokens）。更重要的是，每次都把整本书
-#     发给 LLM 既昂贵又慢。所以我们把文档切成小块，只把"相关的块"发给 LLM。
-#     这就是 RAG 的核心思想。
-#
-# EN: chunk_size=500 → each chunk is ~500 characters
-#     chunk_overlap=50 → consecutive chunks share 50 characters
-#     Why overlap? So that a sentence split across two chunks isn't lost.
-#
-# ZH: chunk_size=500 → 每块约 500 个字符
-#     chunk_overlap=50 → 相邻块共享 50 个字符的重叠
-#     为什么要重叠？防止一句话被切断后语义丢失。
-#
-# EN: RecursiveCharacterTextSplitter is the most recommended splitter.
-#     It tries to split on paragraphs first (\n\n), then sentences (\n),
-#     then words (" "), then characters — in that priority order.
-#     This preserves natural language boundaries as much as possible.
-#
-# ZH: RecursiveCharacterTextSplitter 是最推荐的分割器。
-#     它按优先级依次尝试：段落(\n\n) → 句子(\n) → 单词(" ") → 字符
-#     这样能最大程度保留自然语言的边界。
-#
-# INTERVIEW QUESTION 面试题:
-#   Q: What chunking strategy do you use and why?
-#   A: RecursiveCharacterTextSplitter because it respects natural language
-#      boundaries. chunk_size and chunk_overlap are tuned based on the
-#      document type — smaller chunks for precise retrieval, larger for
-#      more context. Overlap prevents information loss at chunk boundaries.
-#
-splitter = RecursiveCharacterTextSplitter(
-    chunk_size=500,
-    chunk_overlap=50
-)
-chunks = splitter.split_documents(pages)
-print(f"✅ Split into {len(chunks)} chunks.")
+# EN: Vertex AI Embeddings API has two limits:
+#     1. Max 250 texts per call (instance limit)
+#     2. Max 20,000 tokens per call (token limit)
+#     batch_size=50 is a safe value that respects both limits.
+# ZH: Vertex AI 嵌入 API 有两个限制：
+#     1. 单次调用最多 250 条文本（实例限制）
+#     2. 单次调用最多 20,000 tokens（token 限制）
+#     batch_size=50 是同时满足两个限制的安全值。
+def build_faiss_in_batches(chunks, embeddings, batch_size: int = 50):
+    print(f"📦 Embedding {len(chunks)} chunks in batches of {batch_size}...")
+    vs = None
+    total_batches = (len(chunks) + batch_size - 1) // batch_size
+
+    for i in range(0, len(chunks), batch_size):
+        batch = chunks[i:i + batch_size]
+        batch_num = (i // batch_size) + 1
+        print(f"  → Batch {batch_num}/{total_batches} ({len(batch)} chunks)")
+
+        if vs is None:
+            vs = FAISS.from_documents(batch, embeddings)
+        else:
+            batch_store = FAISS.from_documents(batch, embeddings)
+            vs.merge_from(batch_store)
+
+    return vs
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STEP 4 — EMBEDDINGS + VECTOR DATABASE (THE HEART OF RAG)
+# ENDPOINT: /ingest — upload and index a PDF
 # ══════════════════════════════════════════════════════════════════════════════
-#
-# ── What are Embeddings? / 什么是 Embeddings（向量嵌入）? ──────────────────────
-#
-# EN: An embedding model converts text into a list of numbers (a "vector").
-#     Example: "king" → [0.2, 0.8, -0.1, 0.5, ...]  (1536 numbers for OpenAI)
-#     The key property: texts with SIMILAR MEANING produce SIMILAR vectors.
-#     So "dog" and "puppy" will have vectors very close to each other,
-#     while "dog" and "rocket" will be far apart.
-#     This allows us to search by MEANING, not just by keyword matching.
-#
-# ZH: 嵌入模型把文本转换成一组数字（"向量"）。
-#     例如："king" → [0.2, 0.8, -0.1, 0.5, ...]（OpenAI 生成 1536 个数字）
-#     关键特性：语义相似的文本，其向量也相近。
-#     所以 "dog" 和 "puppy" 的向量很接近，
-#     而 "dog" 和 "rocket" 的向量相差很远。
-#     这让我们可以按"语义"搜索，而不只是关键词匹配。
-#
-# ── What is a Vector Database? / 什么是向量数据库? ────────────────────────────
-#
-# EN: A vector database stores all those number lists (vectors) and lets you
-#     search them FAST. When you ask a question, it converts your question
-#     to a vector too, then finds the stored vectors closest to it.
-#     "Closest" = most semantically similar = most relevant chunks.
-#     FAISS (by Meta) is a local, in-memory vector database — fast and free.
-#     Other options: Pinecone, Chroma, Weaviate, Qdrant (for production).
-#
-# ZH: 向量数据库存储所有的向量，并支持快速搜索。
-#     当你提问时，问题也被转成向量，然后数据库找出与它最接近的向量。
-#     "最接近" = 语义最相似 = 最相关的文本块。
-#     FAISS（Meta 开发）是本地内存向量数据库——快速且免费。
-#     生产环境还可以用：Pinecone、Chroma、Weaviate、Qdrant。
-#
-# ── How similarity is measured / 相似度如何计算 ────────────────────────────────
-#
-# EN: FAISS uses "cosine similarity" — it measures the angle between two
-#     vectors. Angle = 0° means identical meaning (score = 1.0).
-#     Angle = 90° means completely unrelated (score = 0.0).
-#
-# ZH: FAISS 使用"余弦相似度"——计算两个向量之间的夹角。
-#     夹角 = 0° 表示语义完全相同（得分 = 1.0）。
-#     夹角 = 90° 表示完全不相关（得分 = 0.0）。
-#
-# INTERVIEW QUESTION 面试题:
-#   Q: What is the difference between a vector database and a regular database?
-#   A: A regular database searches by exact match or range (WHERE name = "John").
-#      A vector database searches by semantic similarity — it finds the most
-#      "meaning-similar" entries using distance metrics like cosine similarity
-#      or euclidean distance on high-dimensional vectors.
-#
-#   Q: Why use FAISS over Pinecone?
-#   A: FAISS is local, free, and great for prototypes and small datasets.
-#      Pinecone is a managed cloud service — better for production because
-#      it supports persistence, scaling, and real-time updates.
-#
-embeddings = OpenAIEmbeddings()
-# EN: This line does 3 things at once:
-#     1. Takes every chunk's text
-#     2. Sends it to OpenAI's embedding API → gets back a 1536-dim vector
-#     3. Stores all vectors in FAISS in memory
-# ZH: 这一行做了 3 件事：
-#     1. 取出每个文本块的内容
-#     2. 发送给 OpenAI 的嵌入 API → 返回 1536 维向量
-#     3. 把所有向量存入内存中的 FAISS 索引
-vectorstore = FAISS.from_documents(chunks, embeddings)
-print("✅ Embeddings created and stored in FAISS.")
+@app.post("/ingest")
+async def ingest_pdf(file: UploadFile = File(...)):
+    global vectorstore
+    try:
+        print(f"📥 Received file: {file.filename}")
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            tmp.write(await file.read())
+            tmp_path = tmp.name
+
+        print(f"📄 Loading PDF from: {tmp_path}")
+        loader = PyPDFLoader(tmp_path)
+        pages = loader.load()
+
+        splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
+        chunks = splitter.split_documents(pages)
+        print(f"✂️ Created {len(chunks)} chunks")
+
+        # Build FAISS in batches to respect Vertex AI's API limits
+        vectorstore = build_faiss_in_batches(chunks, embeddings, batch_size=50)
+        print("✅ Vectorstore built successfully!")
+
+        return {"status": "success", "chunks": len(chunks)}
+
+    except Exception as e:
+        print(f"❌ ERROR DURING INGESTION: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STEP 5 — THE RAG CHAIN (PUTTING IT ALL TOGETHER)
+# ENDPOINT: /ask — query the RAG pipeline
 # ══════════════════════════════════════════════════════════════════════════════
-#
-# EN: This is where RAG (Retrieval-Augmented Generation) is fully assembled.
-#     RAG = Retrieval + Generation. Two separate systems working together:
-#
-#     RETRIEVAL (검색): Given a question → find relevant chunks from FAISS
-#     GENERATION (생성): Given those chunks + question → LLM generates answer
-#
-#     Without RAG, you'd just ask GPT a question and it answers from its
-#     training data — it doesn't know your specific PDF.
-#     With RAG, GPT answers based on YOUR document's actual content.
-#
-# ZH: 这里是 RAG（检索增强生成）的完整组装。
-#     RAG = 检索（Retrieval）+ 生成（Generation），两个系统协同工作：
-#
-#     检索：输入问题 → 从 FAISS 找出相关文本块
-#     生成：将文本块 + 问题 → 交给 LLM 生成回答
-#
-#     没有 RAG：直接问 GPT，它只能用训练数据回答，不了解你的 PDF。
-#     有了 RAG：GPT 基于你文档的实际内容来回答。
-#
-# ── The full RAG flow / 完整 RAG 流程 ─────────────────────────────────────────
-#
-#   User question "What is the main idea?"
-#        ↓
-#   Convert question → vector (via OpenAIEmbeddings)
-#        ↓
-#   FAISS finds top 3 most similar chunks (k=3)
-#        ↓
-#   Chunks + question assembled into a prompt:
-#   "Answer using this context: [chunk1][chunk2][chunk3] Question: ..."
-#        ↓
-#   gpt-4o-mini generates the final answer
-#        ↓
-#   Answer returned to user
-#
-# EN: temperature=0 means the model gives deterministic, factual answers.
-#     Higher temperature (e.g. 0.7) = more creative but less consistent.
-#     For Q&A over documents, always use temperature=0.
-#
-# ZH: temperature=0 表示模型给出确定性的、事实性的回答。
-#     较高的 temperature（如 0.7）= 更有创意但不稳定。
-#     对文档问答，始终使用 temperature=0。
-#
-# EN: k=3 means retrieve the 3 most relevant chunks.
-#     Too low (k=1): might miss context. Too high (k=10): adds noise and cost.
-#     k=3 to k=5 is the standard range for most RAG applications.
-#
-# ZH: k=3 表示检索最相关的 3 个文本块。
-#     太少（k=1）：可能遗漏上下文。太多（k=10）：引入噪音且增加成本。
-#     k=3 到 k=5 是大多数 RAG 应用的标准范围。
-#
-# INTERVIEW QUESTION 面试题:
-#   Q: Explain RAG in simple terms.
-#   A: RAG grounds an LLM's response in a specific knowledge base.
-#      Instead of relying on training data, the model first retrieves
-#      relevant documents using semantic search, then generates an answer
-#      conditioned on those documents. This reduces hallucination and
-#      allows the model to answer questions about private or recent data.
-#
-#   Q: What are the limitations of RAG?
-#   A: 1. Retrieval quality — if the wrong chunks are retrieved, the answer
-#         will be wrong even if the LLM is perfect.
-#      2. Chunk boundary issues — relevant info split across chunks may not
-#         be retrieved together.
-#      3. No reasoning across the full document — only sees k chunks at once.
-#      Solutions: better chunking, re-ranking, larger k, hybrid search.
-#
-llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
-qa_chain = RetrievalQA.from_chain_type(
-    llm=llm,
-    retriever=vectorstore.as_retriever(search_kwargs={"k": 3}),
-)
+@app.post("/ask")
+async def ask_question(request: QuestionRequest):
+    if not vectorstore:
+        raise HTTPException(status_code=400, detail="Please upload a PDF first.")
+
+    # 1. Retrieval (top 10 candidates)
+    retriever = vectorstore.as_retriever(search_kwargs={"k": 10})
+    docs = retriever.invoke(request.question)
+
+    # 2. Reranking with Vertex AI Ranking API (top 3)
+    reranker = VertexAIRank(project_id=PROJECT_ID, location_id="global", top_n=3)
+    reranked_docs = reranker.compress_documents(docs, request.question)
+
+    # 3. Grounded generation
+    context = "\n\n".join([d.page_content for d in reranked_docs])
+    template = """Answer the question strictly using the provided context.
+If the answer is not there, say "I do not have enough information."
+
+Context: {context}
+Question: {question}"""
+
+    prompt = ChatPromptTemplate.from_template(template)
+    chain = prompt | llm | StrOutputParser()
+
+    response = chain.invoke({"context": context, "question": request.question})
+    return {"answer": response}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STEP 6 — CHAT LOOP
+# ENDPOINT: /evaluate — run RAGAS + classic IR metrics on a Q&A test set
 # ══════════════════════════════════════════════════════════════════════════════
-#
-# EN: qa_chain.invoke(question) triggers the full RAG pipeline in one call:
-#     retrieve → format prompt → generate → return answer.
-#     The result is a dict: { "query": "...", "result": "the answer" }
-#
-# ZH: qa_chain.invoke(question) 一次调用触发完整 RAG 流程：
-#     检索 → 格式化提示词 → 生成 → 返回答案。
-#     结果是一个字典：{ "query": "问题", "result": "回答" }
-#
-print("\n💬 PDF chatbot ready! Type 'quit' to exit.\n")
-while True:
-    question = input("You: ")
-    if question.lower() == "quit":
-        break
-    answer = qa_chain.invoke(question)
-    print(f"\nAI: {answer['result']}\n")
+@app.get("/evaluate")
+async def run_evaluation():
+    """
+    Run RAGAS evaluation:
+    - Generator: Gemini 2.5 Flash (Vertex AI)
+    - Judge:     GPT-4o-mini (OpenAI) — independent for unbiased scoring
+
+    Also computes deterministic IR metrics (Recall@K, MRR) using key phrases.
+    """
+    if not vectorstore:
+        raise HTTPException(status_code=400, detail="Please upload a PDF first via /ingest.")
+
+    from eval_dataset import EVAL_DATASET
+
+    questions, answers, contexts, ground_truths = [], [], [], []
+
+    print(f"🧪 Running evaluation on {len(EVAL_DATASET)} questions...")
+
+    # ── Generate answers using your RAG pipeline (Gemini) ───────────────
+    for i, item in enumerate(EVAL_DATASET):
+        question = item["question"]
+        ground_truth = item["ground_truth"]
+        print(f"  → Q{i+1}: {question[:60]}...")
+
+        retriever = vectorstore.as_retriever(search_kwargs={"k": 10})
+        docs = retriever.invoke(question)
+
+        reranker = VertexAIRank(project_id=PROJECT_ID, location_id="global", top_n=3)
+        reranked_docs = reranker.compress_documents(docs, question)
+
+        context = "\n\n".join([d.page_content for d in reranked_docs])
+        template = """Answer the question strictly using the provided context.
+If the answer is not there, say "I do not have enough information."
+
+Context: {context}
+Question: {question}"""
+        prompt = ChatPromptTemplate.from_template(template)
+        chain = prompt | llm | StrOutputParser()
+        answer = chain.invoke({"context": context, "question": question})
+
+        questions.append(question)
+        answers.append(answer)
+        contexts.append([d.page_content for d in reranked_docs])
+        ground_truths.append(ground_truth)
+
+    # ── Build RAGAS dataset ──────────────────────────────────────────────
+    dataset = Dataset.from_dict({
+        "question": questions,
+        "answer": answers,
+        "contexts": contexts,
+        "ground_truth": ground_truths,
+    })
+
+    # ── Independent judge (avoid self-preference bias) ───────────────────
+    # EN: Using a different model family as judge avoids self-preference bias.
+    #     Research shows same-model evaluation inflates scores by ~10%.
+    # ZH: 使用不同模型家族作为评估者，避免自我偏好偏差。
+    #     研究显示同模型自评会使分数虚高约 10%。
+    judge_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+    judge_embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+    ragas_llm = LangchainLLMWrapper(judge_llm)
+    ragas_embeddings = LangchainEmbeddingsWrapper(judge_embeddings)
+
+    print("⚖️  Judge: GPT-4o-mini (OpenAI) — independent from Gemini generator")
+    print("📊 Computing RAGAS metrics...")
+
+    result = evaluate(
+        dataset,
+        metrics=[faithfulness, context_recall],
+        llm=ragas_llm,
+        embeddings=ragas_embeddings,
+    )
+
+    # ── Classic IR metrics: Recall@K and MRR ─────────────────────────────
+    # EN: These complement RAGAS by measuring retrieval quality directly,
+    #     independent of the LLM judge.
+    # ZH: 这些指标补充 RAGAS，直接衡量检索质量，不依赖 LLM 评估者。
+    recall_at_k_scores = []
+    mrr_scores = []
+
+    for item, retrieved_ctx in zip(EVAL_DATASET, contexts):
+        key_phrase = item.get("key_phrase")
+        if not key_phrase:
+            continue  # skip "not in document" questions
+
+        rank = None
+        for rank_idx, ctx_text in enumerate(retrieved_ctx, start=1):
+            if key_phrase.lower() in ctx_text.lower():
+                rank = rank_idx
+                break
+
+        if rank is not None:
+            recall_at_k_scores.append(1.0)
+            mrr_scores.append(1.0 / rank)
+        else:
+            recall_at_k_scores.append(0.0)
+            mrr_scores.append(0.0)
+
+    avg_recall_at_k = (
+        sum(recall_at_k_scores) / len(recall_at_k_scores)
+        if recall_at_k_scores else 0
+    )
+    avg_mrr = sum(mrr_scores) / len(mrr_scores) if mrr_scores else 0
+
+    # ── Combine RAGAS + classic IR metrics ───────────────────────────────
+    ragas_summary = result.to_pandas().mean(numeric_only=True).to_dict()
+    combined_summary = {
+        **ragas_summary,
+        "recall_at_3": avg_recall_at_k,
+        "mrr": avg_mrr,
+    }
+
+    return {
+        "summary": combined_summary,
+        "details": result.to_pandas().to_dict(orient="records"),
+        "config": {
+            "generator": "gemini-2.5-flash (Vertex AI)",
+            "judge": "gpt-4o-mini (OpenAI)",
+            "judge_embeddings": "text-embedding-3-small (OpenAI)",
+            "rationale": "Different model families avoid self-preference bias",
+            "metrics_explained": {
+                "faithfulness": "Is the answer grounded in retrieved context? (LLM-judged)",
+                "context_recall": "Did context contain ground-truth info? (LLM-judged)",
+                "recall_at_3": "Did the top 3 retrieved chunks contain the key phrase? (deterministic)",
+                "mrr": "Mean Reciprocal Rank — 1/rank of first relevant chunk (deterministic)",
+            }
+        }
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# RUN SERVER
+# ══════════════════════════════════════════════════════════════════════════════
+# if __name__ == "__main__":
+#     uvicorn.run(app, host="0.0.0.0", port=8000)
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)

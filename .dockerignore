@@ -1,0 +1,13 @@
+venv/
+__pycache__/
+*.pyc
+.git/
+.env
+.DS_Store
+*.pdf
+*.log
+chroma_db/
+embeddings.jsonl
+embeddings_metadata.json
+screenshots/
+test_results.md
